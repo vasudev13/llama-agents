@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 import tempfile
@@ -86,6 +87,25 @@ async def health() -> Response:
         status_code=200,
         media_type="application/json",
     )
+
+
+async def _k8s_health_response() -> Response:
+    """Shares the same k8s client and thread pool as the manage API, so a wedged
+    apiserver connection shows up on both. See `k8s_health_check` for the check
+    itself, shared with the manage API so pass/fail logic can't drift between them.
+    """
+    status_code, body = await k8s_client.k8s_health_check()
+    return Response(
+        content=json.dumps(body),
+        status_code=status_code,
+        media_type="application/json",
+    )
+
+
+@build_app.get("/readyz")
+async def readyz() -> Response:
+    """Readiness: exercises the kube-apiserver path so a wedged pod leaves rotation."""
+    return await _k8s_health_response()
 
 
 # Build Artifact Endpoints
