@@ -50,6 +50,7 @@ from workflows.runtime.types.commands import (
     CommandFailWorkflow,
     CommandHalt,
 )
+from workflows.runtime.types.step_id import StepId
 from workflows.runtime.types.internal_state import BrokerState, EventAttempt
 
 
@@ -1250,7 +1251,7 @@ def test_handler_status_complete_run_returns_completed_with_result() -> None:
 
 
 def test_handler_status_fail_workflow_returns_failed_with_error_string() -> None:
-    cmd = CommandFailWorkflow(step_name="x", exception=RuntimeError("bad"))
+    cmd = CommandFailWorkflow(step_id=StepId.root("x"), exception=RuntimeError("bad"))
     result = handler_status_from_exit_command(cmd)
     assert result == ("failed", None, "bad")
 
