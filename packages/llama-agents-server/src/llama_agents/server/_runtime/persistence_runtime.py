@@ -15,12 +15,14 @@ import logging
 import sqlite3
 from collections.abc import AsyncIterator, Coroutine
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from typing_extensions import override
 from workflows import Context
 from workflows.context.context_types import SerializedContext
 from workflows.context.serializers import BaseSerializer, JsonSerializer
+from workflows.context.state_store_integration import decode_seed_state
 from workflows.errors import WorkflowCancelledByUser
 from workflows.events import IdleReleasedEvent, StartEvent, StopEvent
 from workflows.runtime.control_loop import replay_ticks_stream
@@ -56,6 +58,7 @@ from .._store.abstract_workflow_store import (
 from .._store.sqlite.sqlite_state_store import SqliteStateStore
 
 logger = logging.getLogger(__name__)
+RESUME_FRESH_HANDLER_GRACE = timedelta(seconds=30)
 
 
 @dataclass
@@ -209,7 +212,7 @@ class TickPersistenceDecorator(BaseRuntimeDecorator):
             return None
 
         if legacy_ctx:
-            self._seed_legacy_state(run_id, legacy_ctx)
+            await self._seed_legacy_state(run_id, legacy_ctx)
             parsed = SerializedContext.from_dict_auto(legacy_ctx)
             init_state = BrokerState.from_serialized(parsed, workflow, serializer)
         else:
@@ -225,7 +228,7 @@ class TickPersistenceDecorator(BaseRuntimeDecorator):
                 async for tick in tick_stream:
                     yield tick
 
-            replay = await replay_ticks_stream(init_state, _with_first())
+            replay = await replay_ticks_stream(init_state, _with_first(), run_id=run_id)
             init_state = replay.state
             exit_command = replay.exit_command
 
@@ -247,7 +250,12 @@ class TickPersistenceDecorator(BaseRuntimeDecorator):
             )
             return None
 
-    def _seed_legacy_state(self, run_id: str, legacy_ctx: dict[str, Any]) -> None:
+    async def _seed_legacy_state(self, run_id: str, legacy_ctx: dict[str, Any]) -> None:
+        """Eagerly migrate a legacy ctx state snapshot into the state table.
+
+        No-op when the state table already has a row for the run (a previous
+        partial run's state must win over the legacy snapshot).
+        """
         try:
             parsed = SerializedContext.from_dict_auto(legacy_ctx)
         except Exception:
@@ -274,7 +282,8 @@ class TickPersistenceDecorator(BaseRuntimeDecorator):
         finally:
             conn.close()
 
-        state_store._write_in_memory_state(state_data)
+        state = decode_seed_state(state_data, JsonSerializer())
+        await state_store.set_state(state)
 
 
 class PersistenceDecorator(TickPersistenceDecorator):
@@ -287,8 +296,11 @@ class PersistenceDecorator(TickPersistenceDecorator):
         self,
         decorated: Runtime,
         store: AbstractWorkflowStore,
+        *,
+        resume_fresh_handler_grace: timedelta | None = RESUME_FRESH_HANDLER_GRACE,
     ) -> None:
         super().__init__(decorated, store)
+        self._resume_fresh_handler_grace = resume_fresh_handler_grace
         self._background_tasks: set[asyncio.Task[None]] = set()
         self.resume_task: asyncio.Task[None] | None = None
 
@@ -300,12 +312,17 @@ class PersistenceDecorator(TickPersistenceDecorator):
 
     @override
     async def launch(self) -> None:
+        resume_started_at = datetime.now(timezone.utc)
         await super().launch()
         self.resume_task = self._spawn_task(
-            self._on_server_start(self._workflows_by_name)
+            self._on_server_start(self._workflows_by_name, resume_started_at)
         )
 
-    async def _on_server_start(self, registered_workflows: dict[str, Workflow]) -> None:
+    async def _on_server_start(
+        self,
+        registered_workflows: dict[str, Workflow],
+        resume_started_at: datetime,
+    ) -> None:
         """Resume previously running (non-idle) workflows from persistence."""
         handlers = await self._store.query(
             HandlerQuery(
@@ -315,6 +332,15 @@ class PersistenceDecorator(TickPersistenceDecorator):
             )
         )
         for persistent in handlers:
+            if (
+                self._resume_fresh_handler_grace is not None
+                and _created_within_resume_grace(
+                    persistent.started_at,
+                    resume_started_at,
+                    self._resume_fresh_handler_grace,
+                )
+            ):
+                continue
             workflow = registered_workflows.get(persistent.workflow_name)
             if workflow is None:
                 continue
@@ -391,3 +417,17 @@ class PersistenceDecorator(TickPersistenceDecorator):
                 self.resume_task.cancel()
             except Exception:
                 pass
+
+
+def _created_within_resume_grace(
+    created_at: datetime | None,
+    resume_started_at: datetime,
+    resume_fresh_handler_grace: timedelta,
+) -> bool:
+    if created_at is None:
+        return False
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    if resume_started_at.tzinfo is None:
+        resume_started_at = resume_started_at.replace(tzinfo=timezone.utc)
+    return created_at > resume_started_at - resume_fresh_handler_grace

@@ -5,12 +5,133 @@ by llama-index agents, including state persistence across steps and
 access from within tool functions.
 """
 
+import threading
+
 from conftest import WorkflowFactory
 from llama_agents_integration_tests.helpers import (
     make_text_response,
     make_tool_call_response,
+    response_generator_from_list,
 )
+from llama_index.core.agent.workflow import (
+    AgentInput,
+    AgentStream,
+    AgentWorkflow,
+    FunctionAgent,
+    ToolCall,
+)
+from llama_index.core.base.llms.types import ChatMessage, MessageRole
+from llama_index.core.llms.mock import MockFunctionCallingLLM
+from llama_index.core.memory import Memory
 from workflows import Context
+
+
+def _mock_agent(
+    name: str,
+    description: str,
+    responses: list[ChatMessage],
+    can_handoff_to: list[str] | None = None,
+) -> FunctionAgent:
+    """Build a FunctionAgent whose mock LLM cycles through fixed responses."""
+    llm = MockFunctionCallingLLM(
+        response_generator=response_generator_from_list(responses)
+    )
+    return FunctionAgent(
+        name=name,
+        description=description,
+        llm=llm,
+        can_handoff_to=can_handoff_to or [],
+    )
+
+
+async def test_multi_agent_handoff_streams_with_memory() -> None:
+    """End-to-end regression for issue 709.
+
+    The reported failure was a router-to-specialist handoff in a streamed
+    multi-agent chat that passed a ``Memory`` object to ``run()``. The handoff
+    tool and agent setup write to ``ctx.store``, which deep-copies state for
+    edit isolation, and the live ``Memory`` (sqlalchemy/aiosqlite/tiktoken
+    internals) used to crash that copy with ``cannot pickle 'module' object``.
+
+    This drives the whole pattern at once: a router hands off to a specialist,
+    the specialist streams the final answer, and a ``Memory`` rides through
+    ``run()`` the way the original repro had it.
+    """
+    router = _mock_agent(
+        "router",
+        "Routes the chat to a specialist.",
+        responses=[
+            make_tool_call_response(
+                "handoff",
+                {"to_agent": "specialist", "reason": "needs specialist"},
+            ),
+        ],
+        can_handoff_to=["specialist"],
+    )
+    specialist = _mock_agent(
+        "specialist",
+        "Answers the question.",
+        responses=[make_text_response("specialist answer")],
+    )
+    workflow = AgentWorkflow(agents=[router, specialist], root_agent="router")
+    memory = Memory.from_defaults(
+        chat_history=[ChatMessage(role=MessageRole.USER, content="earlier turn")]
+    )
+
+    handler = workflow.run(user_msg="help me", memory=memory)
+    active_agents: list[str] = []
+    handoff_tool_calls: list[str] = []
+    specialist_stream = ""
+    async for event in handler.stream_events():
+        if isinstance(event, AgentInput):
+            active_agents.append(event.current_agent_name)
+        elif isinstance(event, ToolCall):
+            handoff_tool_calls.append(event.tool_name)
+        elif (
+            isinstance(event, AgentStream) and event.current_agent_name == "specialist"
+        ):
+            specialist_stream += event.delta
+    result = await handler
+
+    # Router runs, hands off, then the specialist takes over and answers.
+    assert active_agents == ["router", "specialist"]
+    assert "handoff" in handoff_tool_calls
+    assert specialist_stream == "specialist answer"
+    assert result.response.content == "specialist answer"
+
+
+async def test_store_set_accepts_non_serializable_object(
+    create_workflow: WorkflowFactory,
+) -> None:
+    """Regression for issue 710: ctx.store.set with an unpicklable live object.
+
+    Storing an object that wraps a thread lock (e.g. an LLM client) used to
+    raise ``TypeError: cannot pickle '_thread.lock' object`` from the edit-time
+    whole-state deep copy. The object is kept by reference instead.
+    """
+    lock = threading.Lock()
+    captured = None
+
+    async def stash_client(ctx: Context) -> str:
+        nonlocal captured
+        await ctx.store.set("client", lock)
+        captured = await ctx.store.get("client")
+        return "stored"
+
+    workflow = create_workflow(
+        tools=[stash_client],
+        responses=[
+            make_tool_call_response("stash_client"),
+            make_text_response("Done"),
+        ],
+    )
+
+    handler = workflow.run(user_msg="stash it")
+    async for _ in handler.stream_events():
+        pass
+    await handler
+
+    assert captured is lock
 
 
 async def test_initial_state_accessible_in_tool(

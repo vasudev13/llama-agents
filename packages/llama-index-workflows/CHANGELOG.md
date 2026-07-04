@@ -1,5 +1,46 @@
 # llama-index-workflows
 
+## 2.22.2
+
+### Patch Changes
+
+- 8be81d5: Reloading a failed workflow no longer crashes when the failure exception can't be rebuilt.
+- 0dff2cc: Fix crashes during ctx.store edits when state holds non-deepcopyable objects
+
+## 2.22.1
+
+### Patch Changes
+
+- 36fffec: Keep implicit waiters distinct across parallel workflow fan-out branches.
+
+## 2.22.0
+
+### Minor Changes
+
+- cb89120: Add `list[E]` fan-out returns and `list[E]` fan-in joins.
+- fd223e8: Steps can declare multiple single-event parameters to fire once when one of each has arrived.
+- aee5fda: Add typed runtime step identities.
+
+### Patch Changes
+
+- 34e166c: Fix idle checks racing buffered events and stale `ctx.collect_events()` firings.
+- 5724404: Preserve retry state for in-progress workflow steps across serialized context resume.
+- 58e0174: Fix ctx.store.get() returning bound dict methods instead of stored values for state keys named items, keys, values, or get
+
+## 2.21.0
+
+### Minor Changes
+
+- 9a4dd16: Add optional `allowed_types` and `allow_unknown_types` parameters to `JsonSerializer` to support type allowlisting during deserialization
+- db1258b: Support opt-in subclass event routing via the step decorator parameter `accept_event_subclasses`
+- 070fc70: State reads are lockless and read-committed on all backends; edit_state edits an isolated copy committed on block exit.
+- 070fc70: Decode workflow state by payload shape instead of persisted type metadata, and make state-store runtime handoff explicit.
+
+### Patch Changes
+
+- 41e354a: Seed retry jitter with the run id during snapshot tick replay so rebuilt snapshots match the live run, and consume old-format delayed-retry journal entries instead of duplicating them
+- 41e354a: Fix delayed retries being lost when a workflow is snapshotted or idle-released during the retry delay window
+
 ## 2.20.0
 
 ### Minor Changes

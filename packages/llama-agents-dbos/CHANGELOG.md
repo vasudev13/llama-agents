@@ -1,5 +1,22 @@
 # llama-agents-dbos
 
+## 0.4.1
+
+### Patch Changes
+
+- d16172e: Fix DBOS idle release so parked workflows leave the pending set and resume correctly.
+
+## 0.4.0
+
+### Minor Changes
+
+- 070fc70: DBOS postgres workflow store no longer auto-migrates on start; deployments with `run_migrations_on_launch=False` must run migrations explicitly.
+
+### Patch Changes
+
+- 41e354a: Seed retry jitter with the run id during snapshot tick replay so rebuilt snapshots match the live run, and consume old-format delayed-retry journal entries instead of duplicating them
+- 070fc70: Decode workflow state by payload shape instead of persisted type metadata, and make state-store runtime handoff explicit.
+
 ## 0.3.1
 
 ### Patch Changes

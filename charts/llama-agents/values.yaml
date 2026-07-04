@@ -19,7 +19,7 @@ images:
     repository: llamaindex/llama-agents-control-plane
     # -- Control plane image tag
     # @section -- Images
-    tag: "0.12.2"
+    tag: "0.12.3"
     # -- Control plane image pull policy
     # @section -- Images
     pullPolicy: IfNotPresent
@@ -39,7 +39,7 @@ images:
     repository: llamaindex/llama-agents-appserver
     # -- Appserver image tag
     # @section -- Images
-    tag: "0.11.4"
+    tag: "0.11.5"
     # -- Appserver image pull policy
     # @section -- Images
     pullPolicy: IfNotPresent
@@ -76,12 +76,41 @@ controlPlane:
         cpu: 100m
         memory: 256Mi
         ephemeral-storage: 500Mi
-    # -- Startup probe configuration
+    # -- Startup probe configuration. Checks `/health`, a cheap process-liveness
+    # endpoint with no k8s dependency, so a pod is marked started as soon as the
+    # process is up; generous failureThreshold covers slow boots.
+    # @default -- `{httpGet: {path: /health, port: http}, periodSeconds: 5, failureThreshold: 30}`
     # @section -- Control Plane
-    startupProbe: {}
-    # -- Liveness probe configuration
+    startupProbe:
+      httpGet:
+        path: /health
+        port: http
+      periodSeconds: 5
+      failureThreshold: 30
+    # -- Readiness probe configuration. Checks `/readyz`, which round-trips the
+    # kube-apiserver, so a pod with a wedged connection is pulled out of Service
+    # rotation quickly and returns on its own once the connection recovers.
+    # @default -- `{httpGet: {path: /readyz, port: http}, periodSeconds: 10, timeoutSeconds: 8, failureThreshold: 2}`
     # @section -- Control Plane
-    livenessProbe: {}
+    readinessProbe:
+      httpGet:
+        path: /readyz
+        port: http
+      periodSeconds: 10
+      timeoutSeconds: 8
+      failureThreshold: 2
+    # -- Liveness probe configuration. Checks `/health`, a cheap process check with
+    # no kube-apiserver dependency — restarting doesn't fix an apiserver outage, so
+    # liveness stays independent of it and readiness alone handles a wedged
+    # connection (see `/readyz`).
+    # @default -- `{httpGet: {path: /health, port: http}, periodSeconds: 15, failureThreshold: 4}`
+    # @section -- Control Plane
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: http
+      periodSeconds: 15
+      failureThreshold: 4
   deployment:
     # -- Annotations for the control plane Deployment
     # @section -- Control Plane

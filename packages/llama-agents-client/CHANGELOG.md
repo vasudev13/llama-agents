@@ -1,5 +1,44 @@
 # llama-agents-client
 
+## 0.3.11
+
+### Patch Changes
+
+- Updated dependencies [8be81d5]
+- Updated dependencies [0dff2cc]
+  - llama-index-workflows@2.22.2
+
+## 0.3.10
+
+### Patch Changes
+
+- Updated dependencies [36fffec]
+  - llama-index-workflows@2.22.1
+
+## 0.3.9
+
+### Patch Changes
+
+- Updated dependencies [34e166c]
+- Updated dependencies [cb89120]
+- Updated dependencies [fd223e8]
+- Updated dependencies [5724404]
+- Updated dependencies [58e0174]
+- Updated dependencies [aee5fda]
+  - llama-index-workflows@2.22.0
+
+## 0.3.8
+
+### Patch Changes
+
+- Updated dependencies [9a4dd16]
+- Updated dependencies [db1258b]
+- Updated dependencies [070fc70]
+- Updated dependencies [41e354a]
+- Updated dependencies [41e354a]
+- Updated dependencies [070fc70]
+  - llama-index-workflows@2.21.0
+
 ## 0.3.7
 
 ### Patch Changes

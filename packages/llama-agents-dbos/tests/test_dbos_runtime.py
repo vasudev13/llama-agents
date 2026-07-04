@@ -12,7 +12,7 @@ import asyncio
 from contextlib import suppress
 from types import SimpleNamespace
 from typing import Any, Generator, cast
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import asyncpg
 import pytest
@@ -26,9 +26,14 @@ from llama_agents.server._store.postgres_state_store import PostgresStateStore
 from pydantic import Field
 from sqlalchemy.engine import Engine
 from workflows.context import Context
+from workflows.context.serializers import JsonSerializer
+from workflows.context.state_store import DictState, InMemoryStateStore, StateStore
 from workflows.decorators import step
 from workflows.events import Event, StartEvent, StopEvent
+from workflows.runtime.types.internal_state import BrokerState
 from workflows.runtime.types.named_task import WorkerTask
+from workflows.runtime.types.plugin import RegisteredWorkflow
+from workflows.runtime.types.step_id import StepId
 from workflows.testing import WorkflowTestRunner
 from workflows.workflow import Workflow
 
@@ -61,7 +66,10 @@ def test_postgres_adapter_uses_resolved_pool_for_sync_state_store() -> None:
     state_store = adapter.get_state_store()
 
     assert isinstance(state_store, PostgresStateStore)
-    assert state_store._pool is pool
+    assert state_store.run_id == "run-1"
+    # The async factory raising above proves the resolved pool was used
+    # synchronously; confirm it reached the storage layer.
+    assert cast(Any, state_store)._storage._pool is pool
 
 
 @pytest.fixture(scope="module")
@@ -289,6 +297,88 @@ async def test_run_workflow_does_not_create_store(dbos_runtime: DBOSRuntime) -> 
 
 
 @pytest.mark.asyncio
+async def test_run_workflow_seeds_state_store_from_durable_handle() -> None:
+    class RecordingStateStore(InMemoryStateStore[DictState]):
+        def __init__(self) -> None:
+            super().__init__(DictState())
+            self.ensure_seeded_called = False
+
+        async def ensure_seeded(self) -> None:
+            self.ensure_seeded_called = True
+            await super().ensure_seeded()
+
+    class RecordingWorkflowStore:
+        def __init__(self) -> None:
+            self.state_store = RecordingStateStore()
+            self.start_called = False
+            self.create_state_store_calls: list[tuple[Any, ...]] = []
+
+        async def start(self) -> None:
+            self.start_called = True
+
+        def create_state_store(
+            self,
+            run_id: str,
+            state_type: type[Any] | None = None,
+            serialized_state: dict[str, Any] | None = None,
+            serializer: Any = None,
+        ) -> StateStore[Any]:
+            self.create_state_store_calls.append(
+                (run_id, state_type, serialized_state, serializer)
+            )
+            return self.state_store
+
+    class SimpleWf(Workflow):
+        @step
+        async def do_it(self, ev: StartEvent) -> StopEvent:
+            return StopEvent(result="done")
+
+    async def workflow_run_fn(
+        init_state: BrokerState,
+        start_event: StartEvent | None = None,
+        tags: dict[str, Any] | None = None,
+    ) -> StopEvent:
+        return StopEvent(result="done")
+
+    runtime = DBOSRuntime(polling_interval_sec=0.01)
+    runtime._dbos_launched = True
+    workflow = SimpleWf()
+    workflow_store = RecordingWorkflowStore()
+    serialized_state = {"store_type": "sqlite", "run_id": "old-run"}
+    serializer = JsonSerializer()
+    fake_handle = AsyncMock()
+
+    with (
+        patch.object(runtime, "create_workflow_store", return_value=workflow_store),
+        patch.object(
+            runtime,
+            "get_registered",
+            return_value=RegisteredWorkflow(
+                workflow=workflow, workflow_run_fn=workflow_run_fn, steps={}
+            ),
+        ),
+        patch(
+            "llama_agents.dbos.runtime.DBOS.start_workflow_async",
+            new=AsyncMock(return_value=fake_handle),
+        ),
+    ):
+        adapter = runtime.run_workflow(
+            "run-1",
+            workflow,
+            BrokerState.from_workflow(workflow),
+            serialized_state=serialized_state,
+            serializer=serializer,
+        )
+        await cast(Any, adapter)._ensure_workflow_started()
+
+    assert workflow_store.start_called
+    assert workflow_store.state_store.ensure_seeded_called
+    assert workflow_store.create_state_store_calls == [
+        ("run-1", DictState, serialized_state, serializer)
+    ]
+
+
+@pytest.mark.asyncio
 async def test_replay_wait_for_next_task_timeout_returns_none(
     journal_db_path: str,
     sqlite_engine: Engine,
@@ -308,7 +398,7 @@ async def test_replay_wait_for_next_task_timeout_returns_none(
 
     try:
         result = await adapter.wait_for_next_task(
-            [WorkerTask("step_a", 0, task)],
+            [WorkerTask(StepId.root("step_a"), 0, task)],
             [],
             timeout=0.01,
         )

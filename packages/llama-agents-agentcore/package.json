@@ -1,9 +1,9 @@
 {
   "name": "llama-agents-agentcore",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "private": false,
   "dependencies": {
-    "llama-agents-core": "workspace:*",
-    "llama-agents-appserver": "workspace:*"
+    "llama-agents-core": "workspace:^",
+    "llama-agents-appserver": "workspace:^"
   }
 }

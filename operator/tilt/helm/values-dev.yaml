@@ -33,6 +33,12 @@ controlPlane:
       periodSeconds: 1
       timeoutSeconds: 2
       failureThreshold: 60
+    readinessProbe:
+      httpGet:
+        path: /readyz
+        port: 8000
+      periodSeconds: 5
+      timeoutSeconds: 5
     livenessProbe:
       httpGet:
         path: /health

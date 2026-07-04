@@ -42,11 +42,18 @@ from workflows.retry_policy import (
     stop_before_delay,
     wait_fixed,
 )
-from workflows.runtime.control_loop import control_loop
+from workflows.runtime.control_loop.runner import _ControlLoopRunner, control_loop
 from workflows.runtime.types.internal_state import BrokerState
 from workflows.runtime.types.plugin import RunContext, run_context
 from workflows.runtime.types.step_function import as_step_worker_function
-from workflows.runtime.types.ticks import TickAddEvent, TickCancelRun
+from workflows.runtime.types.step_id import StepId
+from workflows.runtime.types.ticks import (
+    TickAddEvent,
+    TickCancelRun,
+    TickIdleCheck,
+    TickWakeup,
+    WorkflowTick,
+)
 from workflows.workflow import Workflow
 
 from .conftest import MockRunAdapter, MockRuntime
@@ -434,7 +441,9 @@ async def test_control_loop_step_failure_publishes_stop_event(
         "Failed event exception should carry the message"
     )
     assert stop_event.attempts == 1, "Failed event should contain the attempt count"
-    assert stop_event.elapsed_seconds >= 0, "Failed event should contain elapsed time"
+    assert stop_event.elapsed_seconds is not None and stop_event.elapsed_seconds >= 0, (
+        "Failed event should contain elapsed time"
+    )
 
 
 @pytest.mark.asyncio
@@ -554,6 +563,123 @@ async def test_control_loop_collect_events_same_type(
 
 
 @pytest.mark.asyncio
+async def test_control_loop_reruns_stale_collect_events_firing(
+    test_plugin: MockRunAdapter,
+) -> None:
+    class Item(Event):
+        n: int
+
+    class Pair(Event):
+        nums: list[int]
+
+    seeded = asyncio.Event()
+    racing_workers: set[int] = set()
+    release_race = asyncio.Event()
+
+    class StaleCollectWorkflow(Workflow):
+        @step
+        async def start(self, ctx: Context, ev: StartEvent) -> None:
+            ctx.send_event(Item(n=1))
+
+        @step(num_workers=2)
+        async def collect(self, ctx: Context, ev: Item) -> Pair | None:
+            if ev.n in {2, 3}:
+                racing_workers.add(ev.n)
+                if racing_workers == {2, 3}:
+                    release_race.set()
+                await release_race.wait()
+
+            events = ctx.collect_events(ev, [Item, Item])
+            if events is None:
+                if ev.n == 1:
+                    seeded.set()
+                return None
+            return Pair(nums=sorted(e.n for e in events))
+
+        @step(num_workers=1)
+        async def finish(self, ctx: Context, ev: Pair) -> StopEvent | None:
+            pairs = ctx.collect_events(ev, [Pair, Pair])
+            if pairs is None:
+                return None
+            return StopEvent(result=sorted(pair.nums for pair in pairs))
+
+    task = asyncio.create_task(
+        run_control_loop(
+            workflow=StaleCollectWorkflow(timeout=5.0),
+            start_event=StartEvent(),
+            test_runtime=test_plugin,
+        )
+    )
+
+    await asyncio.wait_for(seeded.wait(), timeout=1.0)
+    await test_plugin.send_event(TickAddEvent(event=Item(n=2)))
+    await test_plugin.send_event(TickAddEvent(event=Item(n=3)))
+    await test_plugin.send_event(TickAddEvent(event=Item(n=4)))
+
+    result = await asyncio.wait_for(task, timeout=2.0)
+
+    assert result.result == [[1, 2], [3, 4]]
+
+
+@pytest.mark.asyncio
+async def test_control_loop_defers_idle_behind_buffered_tick(
+    test_plugin: MockRunAdapter,
+) -> None:
+    class ContinueEvent(Event):
+        value: str
+
+    class BufferedTickWorkflow(Workflow):
+        @step
+        async def start(self, ev: StartEvent) -> None:
+            return None
+
+        @step
+        async def finish(self, ev: ContinueEvent) -> StopEvent:
+            return StopEvent(result=ev.value)
+
+    workflow = BufferedTickWorkflow(timeout=2.0)
+    step_workers = {}
+    for name, step_func in workflow._get_steps().items():
+        unbound = getattr(step_func, "__func__", step_func)
+        step_workers[name] = as_step_worker_function(unbound)
+
+    run_id = str(uuid.uuid4())
+    mock_runtime = MockRuntime()
+    test_plugin.set_state_store(InMemoryStateStore(DictState()))
+    mock_runtime.set_adapter(run_id, test_plugin)
+    workflow._runtime = mock_runtime
+    with setting_run_id(run_id):
+        ctx = Context._create_internal(workflow=workflow)
+
+    state = BrokerState.from_workflow(workflow)
+    state.is_running = True
+    runner = _ControlLoopRunner(workflow, test_plugin, ctx, step_workers, state)
+    runner.tick_buffer = [
+        TickIdleCheck(),
+        TickAddEvent(event=ContinueEvent(value="done")),
+    ]
+
+    with setting_run_id(run_id):
+        run_ctx = RunContext(
+            workflow=workflow,
+            run_adapter=test_plugin,
+            context=ctx,
+            steps=step_workers,
+        )
+        with run_context(run_ctx):
+            result = await runner.run(start_event=None)
+
+    assert result.result == "done"
+    seen: list[Event] = []
+    while True:
+        ev = await test_plugin.get_stream_event(timeout=1.0)
+        seen.append(ev)
+        if isinstance(ev, StopEvent):
+            break
+    assert not any(isinstance(ev, WorkflowIdleEvent) for ev in seen)
+
+
+@pytest.mark.asyncio
 async def test_control_loop_collect_events_multiple_types(
     test_plugin: MockRunAdapter,
 ) -> None:
@@ -631,7 +757,9 @@ async def test_control_loop_per_step_routing(test_plugin: MockRunAdapter) -> Non
     )
 
     # Route explicitly to the 'second' step with an accepted event type
-    await test_plugin.send_event(TickAddEvent(event=SomeEvent(), step_name="second"))
+    await test_plugin.send_event(
+        TickAddEvent(event=SomeEvent(), step_id=StepId.root("second"))
+    )
 
     result = await asyncio.wait_for(task, timeout=2.0)
     assert isinstance(result, StopEvent)
@@ -763,6 +891,50 @@ async def test_control_loop_retry_with_delay(
         )
     # Verify time-machine is active (epoch starts at 1000.0)
     assert wf.attempt_times[0] >= 1000.0
+
+
+@pytest.mark.asyncio
+async def test_wakeup_heap_never_holds_work_items(
+    test_plugin_with_time_machine: tuple[MockRunAdapter, time_machine.Coordinates],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wakeup heap holds only contentless, re-derivable alarms.
+
+    A delayed retry must be represented in BrokerState (queued with
+    not_before) plus a contentless TickWakeup poke — never as a
+    payload-carrying TickAddEvent in the heap, which a snapshot cannot see.
+    """
+    test_plugin, _ = test_plugin_with_time_machine
+    scheduled: list[WorkflowTick] = []
+    original_schedule_tick = _ControlLoopRunner.schedule_tick
+
+    def recording_schedule_tick(
+        self: _ControlLoopRunner, tick: WorkflowTick, at_time: float
+    ) -> None:
+        scheduled.append(tick)
+        original_schedule_tick(self, tick, at_time)
+
+    monkeypatch.setattr(_ControlLoopRunner, "schedule_tick", recording_schedule_tick)
+
+    class RetryingWorkflow(Workflow):
+        attempts = 0
+
+        @step(retry_policy=ConstantDelayRetryPolicy(maximum_attempts=3, delay=0.02))
+        async def flaky(self, ev: StartEvent) -> StopEvent:
+            RetryingWorkflow.attempts += 1
+            if RetryingWorkflow.attempts < 2:
+                raise RuntimeError("fail once")
+            return StopEvent(result="ok")
+
+    result = await run_control_loop(
+        workflow=RetryingWorkflow(timeout=5.0),
+        start_event=StartEvent(),
+        test_runtime=test_plugin,
+    )
+
+    assert isinstance(result, StopEvent)
+    assert any(isinstance(t, TickWakeup) for t in scheduled)
+    assert not any(isinstance(t, TickAddEvent) for t in scheduled)
 
 
 @pytest.mark.asyncio

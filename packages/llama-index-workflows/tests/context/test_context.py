@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import gc
 import json
+import pickle
 import weakref
 from typing import cast
 
@@ -18,16 +20,19 @@ from workflows.context.context import (
     _warn_get_result,
     _warn_is_running_in_step,
 )
+from workflows.context.context_types import CURRENT_SERIALIZED_VERSION
 from workflows.context.external_context import ExternalContext
 from workflows.context.internal_context import InternalContext
-from workflows.context.serializers import JsonSerializer
+from workflows.context.serializers import JsonSerializer, PickleSerializer
 from workflows.context.state_store import (
     DictState,
     InMemoryStateStore,
+    decode_state,
     deserialize_state_from_dict,
+    encode_state,
 )
 from workflows.decorators import step
-from workflows.errors import ContextStateError, WorkflowRuntimeError
+from workflows.errors import ContextSerdeError, ContextStateError, WorkflowRuntimeError
 from workflows.events import (
     Event,
     HumanResponseEvent,
@@ -40,6 +45,7 @@ from workflows.plugins.basic import (
     BasicRuntime,
     setting_run_id,
 )
+from workflows.retry_policy import retry_policy, stop_after_attempt, wait_fixed
 from workflows.runtime.types.internal_state import BrokerState
 from workflows.runtime.types.ticks import TickAddEvent
 from workflows.testing import WorkflowTestRunner
@@ -199,7 +205,7 @@ async def test_get_not_found(internal_ctx: Context) -> None:
 
 @pytest.mark.asyncio
 async def test_send_event_step_is_none() -> None:
-    """Test that external events create TickAddEvent with step_name=None.
+    """Test that external events create TickAddEvent with step_id=None.
 
     Uses a workflow that waits for the external event so we can verify
     the tick is logged before the workflow completes.
@@ -222,7 +228,7 @@ async def test_send_event_step_is_none() -> None:
         assert isinstance(external_face, ExternalContext)
 
         # Wait for event to appear in tick log (up to 1 second)
-        expected_tick = TickAddEvent(event=ev, step_name=None)
+        expected_tick = TickAddEvent(event=ev, step_id=None)
         for _ in range(100):
             if expected_tick in external_face._tick_log:
                 break
@@ -323,7 +329,7 @@ async def test_wait_for_event_in_workflow_serialization() -> None:
         if isinstance(ev, Event) and ev.msg == "foo":
             ctx_dict = handler.ctx.to_dict()
             # Check that at least one worker has waiters
-            assert ctx_dict["version"] == 1
+            assert ctx_dict["version"] == CURRENT_SERIALIZED_VERSION
             total_waiters = sum(
                 len(worker_data["collected_waiters"])
                 for worker_data in ctx_dict["workers"].values()
@@ -357,6 +363,136 @@ async def test_wait_for_event_in_workflow_serialization() -> None:
         len(worker.collected_waiters) for worker in state.workers.values()
     )
     assert total_waiters == 0
+
+
+def test_context_from_dict_rejects_future_version_as_context_serde_error(
+    workflow: Workflow,
+) -> None:
+    payload = {
+        "version": CURRENT_SERIALIZED_VERSION + 1,
+        "state": {},
+        "is_running": False,
+        "workers": {},
+    }
+
+    with pytest.raises(ContextSerdeError, match="newer version"):
+        Context.from_dict(workflow, payload)
+
+
+class TwoStepHITLWorkflow(Workflow):
+    """The documented two-step HITL shape: emit InputRequiredEvent, consume HumanResponseEvent."""
+
+    @step
+    async def ask(self, ctx: Context, ev: StartEvent) -> InputRequiredEvent:
+        return InputRequiredEvent()
+
+    @step
+    async def answer(self, ctx: Context, ev: HumanResponseEvent) -> StopEvent:
+        return StopEvent(result=ev.response)
+
+
+@pytest.mark.asyncio
+async def test_to_dict_after_stream_events_break() -> None:
+    """Regression for #668: to_dict() must not hang when called after breaking
+    out of the stream_events() loop instead of inside it."""
+    workflow = TwoStepHITLWorkflow()
+    handler = workflow.run()
+
+    async for ev in handler.stream_events():
+        if isinstance(ev, InputRequiredEvent):
+            break
+
+    ctx_dict = handler.ctx.to_dict()
+    assert ctx_dict["is_running"] is True
+    assert ctx_dict["workers"]
+    await handler.cancel_run()
+
+
+class NamedResponseEvent(HumanResponseEvent):
+    response: str
+
+
+@pytest.mark.asyncio
+async def test_to_dict_after_stream_events_break_resumes() -> None:
+    """Regression for #668: a snapshot taken after breaking out of
+    stream_events() (no cancel first) restores and resumes correctly."""
+
+    class WaiterWorkflow(Workflow):
+        @step
+        async def ask(self, ctx: Context, ev: StartEvent) -> StopEvent:
+            response = await ctx.wait_for_event(
+                NamedResponseEvent,
+                waiter_event=InputRequiredEvent(),
+            )
+            return StopEvent(result=response.response)
+
+    workflow = WaiterWorkflow(timeout=1.0)
+    handler = workflow.run()
+
+    async for ev in handler.stream_events():
+        if isinstance(ev, InputRequiredEvent):
+            break
+
+    ctx_dict = handler.ctx.to_dict()
+    total_waiters = sum(
+        len(worker_data["collected_waiters"])
+        for worker_data in ctx_dict["workers"].values()
+    )
+    assert total_waiters == 1
+    waiters = [
+        waiter
+        for worker_data in ctx_dict["workers"].values()
+        for waiter in worker_data["collected_waiters"]
+    ]
+    work_item_id = waiters[0]["work_item_id"]
+    assert work_item_id
+    assert waiters[0]["waiter_id"].endswith(f"_{work_item_id}")
+    await handler.cancel_run()
+
+    new_ctx = Context.from_dict(workflow, ctx_dict)
+    new_handler = workflow.run(ctx=new_ctx)
+    new_handler.ctx.send_event(NamedResponseEvent(response="bob"))
+    result = await new_handler
+    assert result == "bob"
+
+
+@pytest.mark.asyncio
+async def test_legacy_implicit_waiter_id_survives_serialization_resume() -> None:
+    """Implicit waiters serialized before work item IDs should still resume."""
+
+    class WaiterWorkflow(Workflow):
+        @step
+        async def ask(self, ctx: Context, ev: StartEvent) -> StopEvent:
+            response = await ctx.wait_for_event(
+                NamedResponseEvent,
+                waiter_event=InputRequiredEvent(),
+            )
+            return StopEvent(result=response.response)
+
+    workflow = WaiterWorkflow(timeout=1.0)
+    handler = workflow.run()
+
+    async for ev in handler.stream_events():
+        if isinstance(ev, InputRequiredEvent):
+            break
+
+    ctx_dict = handler.ctx.to_dict()
+    legacy_waiter_id = (
+        f"waiter_{NamedResponseEvent.__module__}.{NamedResponseEvent.__name__}_"
+        f"{str({})}"
+    )
+    for worker_data in ctx_dict["workers"].values():
+        for waiter in worker_data["collected_waiters"]:
+            waiter["waiter_id"] = legacy_waiter_id
+            waiter.pop("work_item_id", None)
+    ctx_dict.pop("work_item_seq", None)
+    await handler.cancel_run()
+
+    new_ctx = Context.from_dict(workflow, ctx_dict)
+    new_handler = workflow.run(ctx=new_ctx)
+    new_handler.ctx.send_event(NamedResponseEvent(response="legacy"))
+    result = await new_handler
+    assert result == "legacy"
 
 
 class Waiter1(Event):
@@ -451,12 +587,250 @@ async def test_wait_for_multiple_events_in_workflow() -> None:
     assert sorted(result) == ["buzz", "fizz"]
 
 
+class ParallelWaitEvent(Event):
+    branch: str
+
+
+class ParallelWaitDone(Event):
+    branch: str
+    response: str
+
+
+class ParallelImplicitWaiterWorkflow(Workflow):
+    @step
+    async def dispatch(self, ctx: Context, ev: StartEvent) -> ParallelWaitEvent:
+        for branch in ("a", "b", "c"):
+            ctx.send_event(ParallelWaitEvent(branch=branch))
+        return None  # type: ignore
+
+    @step(num_workers=3)
+    async def wait_branch(
+        self, ctx: Context, ev: ParallelWaitEvent
+    ) -> ParallelWaitDone:
+        response = await ctx.wait_for_event(
+            HumanResponseEvent,
+            waiter_event=InputRequiredEvent(prefix=f"approve {ev.branch}"),  # type: ignore
+        )
+        return ParallelWaitDone(branch=ev.branch, response=response.response)
+
+    @step
+    async def collect(self, ctx: Context, ev: ParallelWaitDone) -> StopEvent:
+        events: list[ParallelWaitDone] | None = ctx.collect_events(  # type: ignore
+            ev, [ParallelWaitDone, ParallelWaitDone, ParallelWaitDone]
+        )
+        if events is None:
+            return None  # type: ignore
+
+        return StopEvent(result=sorted((e.branch, e.response) for e in events))
+
+
+@pytest.mark.asyncio
+async def test_parallel_implicit_waiters_are_not_collapsed() -> None:
+    workflow = ParallelImplicitWaiterWorkflow(timeout=1.0)
+    handler = workflow.run()
+    prefixes: set[str] = set()
+
+    async for ev in handler.stream_events():
+        if isinstance(ev, InputRequiredEvent):
+            prefixes.add(ev.prefix)
+            if len(prefixes) == 3:
+                handler.ctx.send_event(HumanResponseEvent(response="approved"))  # type: ignore
+                break
+
+    assert prefixes == {"approve a", "approve b", "approve c"}
+    result = await handler
+    assert result == [
+        ("a", "approved"),
+        ("b", "approved"),
+        ("c", "approved"),
+    ]
+
+
+class IdenticalWaitEvent(Event):
+    pass
+
+
+class IdenticalWaitDone(Event):
+    response: str
+
+
+class IdenticalImplicitWaiterWorkflow(Workflow):
+    @step
+    async def dispatch(self, ctx: Context, ev: StartEvent) -> IdenticalWaitEvent:
+        for _ in range(3):
+            ctx.send_event(IdenticalWaitEvent())
+        return None  # type: ignore
+
+    @step(num_workers=3)
+    async def wait_branch(
+        self, ctx: Context, ev: IdenticalWaitEvent
+    ) -> IdenticalWaitDone:
+        response = await ctx.wait_for_event(
+            HumanResponseEvent,
+            waiter_event=InputRequiredEvent(prefix="approve"),  # type: ignore
+        )
+        return IdenticalWaitDone(response=response.response)
+
+    @step
+    async def collect(self, ctx: Context, ev: IdenticalWaitDone) -> StopEvent:
+        events: list[IdenticalWaitDone] | None = ctx.collect_events(  # type: ignore
+            ev, [IdenticalWaitDone, IdenticalWaitDone, IdenticalWaitDone]
+        )
+        if events is None:
+            return None  # type: ignore
+
+        return StopEvent(result=[e.response for e in events])
+
+
+@pytest.mark.asyncio
+async def test_parallel_identical_implicit_waiters_are_not_collapsed() -> None:
+    workflow = IdenticalImplicitWaiterWorkflow(timeout=1.0)
+    handler = workflow.run()
+    input_required_count = 0
+
+    async for ev in handler.stream_events():
+        if isinstance(ev, InputRequiredEvent):
+            input_required_count += 1
+            if input_required_count == 3:
+                handler.ctx.send_event(HumanResponseEvent(response="approved"))  # type: ignore
+                break
+
+    assert input_required_count == 3
+    result = await handler
+    assert result == ["approved", "approved", "approved"]
+
+
+@pytest.mark.asyncio
+async def test_parallel_implicit_waiters_survive_snapshot_resume() -> None:
+    """The per-invocation waiter ids must round-trip: snapshot three suspended
+    fan-out branches, restore, and every branch still resolves."""
+    workflow = ParallelImplicitWaiterWorkflow(timeout=5.0)
+    handler = workflow.run()
+    prefixes: set[str] = set()
+
+    async for ev in handler.stream_events():
+        if isinstance(ev, InputRequiredEvent):
+            prefixes.add(ev.prefix)
+            if len(prefixes) == 3:
+                break
+
+    assert prefixes == {"approve a", "approve b", "approve c"}
+    ctx_dict = handler.ctx.to_dict()
+    total_waiters = sum(
+        len(worker_data["collected_waiters"])
+        for worker_data in ctx_dict["workers"].values()
+    )
+    assert total_waiters == 3
+    await handler.cancel_run()
+
+    resumed = workflow.run(ctx=Context.from_dict(workflow, ctx_dict))
+    resumed.ctx.send_event(HumanResponseEvent(response="approved"))  # type: ignore
+    result = await resumed
+    assert result == [
+        ("a", "approved"),
+        ("b", "approved"),
+        ("c", "approved"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_implicit_waiter_survives_retry() -> None:
+    """A retry is the same invocation, a new attempt. After a step acquires its
+    waiter response then fails once, the replay must re-acquire the same resolved
+    waiter (it survives until the step completes) instead of re-prompting."""
+    attempts = 0
+
+    class RetryWaiterWorkflow(Workflow):
+        @step(retry_policy=retry_policy(wait=wait_fixed(0), stop=stop_after_attempt(3)))
+        async def ask(self, ctx: Context, ev: StartEvent) -> StopEvent:
+            nonlocal attempts
+            response = await ctx.wait_for_event(
+                HumanResponseEvent, waiter_event=InputRequiredEvent()
+            )
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("transient failure after acquiring the waiter")
+            return StopEvent(result=response.response)
+
+    workflow = RetryWaiterWorkflow(timeout=5.0)
+    handler = workflow.run()
+    prompts = 0
+    answered = False
+    async for ev in handler.stream_events():
+        if isinstance(ev, InputRequiredEvent):
+            prompts += 1
+            if not answered:
+                handler.ctx.send_event(HumanResponseEvent(response="once"))  # type: ignore
+                answered = True
+
+    result = await handler
+    assert result == "once"
+    assert attempts == 2  # one failure, then one success — same invocation
+    assert prompts == 1  # the human is asked exactly once across the retry
+
+
+@pytest.mark.asyncio
+async def test_requirements_waiter_survives_snapshot_resume() -> None:
+    """A waiter created with requirements is re-pinged on resume (via
+    rehydrate_with_ticks). The invocation id must ride along on that re-ping so
+    the replayed step regenerates the same waiter id and resolves once."""
+
+    class ReqWaiterWorkflow(Workflow):
+        @step
+        async def ask(self, ctx: Context, ev: StartEvent) -> StopEvent:
+            response = await ctx.wait_for_event(
+                HumanResponseEvent,
+                waiter_event=InputRequiredEvent(),
+                requirements={"response": "go"},
+            )
+            return StopEvent(result=response.response)
+
+    workflow = ReqWaiterWorkflow(timeout=5.0)
+    handler = workflow.run()
+    async for ev in handler.stream_events():
+        if isinstance(ev, InputRequiredEvent):
+            break
+
+    ctx_dict = handler.ctx.to_dict()
+    await handler.cancel_run()
+
+    resumed = workflow.run(ctx=Context.from_dict(workflow, ctx_dict))
+    # The mismatched response is ignored by the requirement; the matching one
+    # resolves the re-pinged waiter.
+    resumed.ctx.send_event(HumanResponseEvent(response="nope"))  # type: ignore
+    resumed.ctx.send_event(HumanResponseEvent(response="go"))  # type: ignore
+    result = await resumed
+    assert result == "go"
+
+
 @pytest.mark.asyncio
 async def test_clear(internal_ctx: Context) -> None:
     await internal_ctx.store.set("test_key", 42)
     await internal_ctx.store.clear()
     res = await internal_ctx.store.get("test_key", default=None)
     assert res is None
+
+
+class ParentClearState(BaseModel):
+    a: int = 0
+
+
+class ChildClearState(ParentClearState):
+    b: int = 0
+
+
+@pytest.mark.asyncio
+async def test_clear_resets_subclass_fields() -> None:
+    """Clear is a reset to the current state's type, not a merge."""
+    store = InMemoryStateStore(ParentClearState())
+    await store.set_state(ChildClearState(a=1, b=7))
+
+    await store.clear()
+
+    state = await store.get_state()
+    assert isinstance(state, ChildClearState)
+    assert state.a == 0
+    assert state.b == 0
 
 
 @pytest.mark.asyncio
@@ -729,6 +1103,167 @@ class TypedTestState(BaseModel):
     name: str = "default"
 
 
+class CustomDictState(DictState):
+    """DictState subclass for codec dispatch testing."""
+
+
+def test_encode_decode_state_handles_dict_state() -> None:
+    serializer = JsonSerializer()
+    state = DictState(answer=42, name="dict")
+
+    state_data, _, _ = encode_state(state, serializer)
+    result = decode_state(state_data, serializer)
+
+    assert isinstance(result, DictState)
+    assert result["answer"] == 42
+    assert result["name"] == "dict"
+
+
+def test_encode_decode_state_handles_dict_state_subclass() -> None:
+    serializer = JsonSerializer()
+    state = CustomDictState()
+    state["answer"] = 42
+    state["name"] = "subclass"
+
+    state_data, _, _ = encode_state(state, serializer)
+    result = decode_state(state_data, serializer)
+
+    assert isinstance(result, DictState)
+    assert result["answer"] == 42
+    assert result["name"] == "subclass"
+
+
+def test_encode_decode_state_handles_typed_state() -> None:
+    serializer = JsonSerializer()
+    state = TypedTestState(counter=7, name="typed")
+
+    state_data, _, _ = encode_state(state, serializer)
+    result = decode_state(state_data, serializer)
+
+    assert isinstance(result, TypedTestState)
+    assert result.counter == 7
+    assert result.name == "typed"
+
+
+def test_decode_state_respects_json_serializer_allowed_types() -> None:
+    serializer = JsonSerializer()
+    state = TypedTestState(counter=7, name="typed")
+    state_data, _, _ = encode_state(state, serializer)
+    restricted_serializer = JsonSerializer(allowed_types=[DictState])
+
+    with pytest.raises(ValueError, match="Refusing to import disallowed"):
+        decode_state(state_data, restricted_serializer)
+
+
+def test_decode_state_allows_dict_state_under_restricted_allowlist() -> None:
+    """A restricted allowlist must not reject the default DictState container."""
+    serializer = JsonSerializer()
+    state = DictState()
+    state["inner"] = TypedTestState(counter=3, name="allowed")
+    state["plain"] = 42
+    state_data, _, _ = encode_state(state, serializer)
+    restricted_serializer = JsonSerializer(allowed_types=[TypedTestState])
+
+    result = decode_state(state_data, restricted_serializer)
+
+    assert isinstance(result, DictState)
+    assert isinstance(result["inner"], TypedTestState)
+    assert result["inner"].counter == 3
+    assert result["plain"] == 42
+
+
+def test_decode_state_typed_payload_with_unimportable_type_raises() -> None:
+    serializer = JsonSerializer()
+    state_data = json.dumps(
+        {
+            "__is_pydantic": True,
+            "value": {"counter": 1, "name": "gone"},
+            "qualified_name": "missing.module.MovedState",
+        }
+    )
+
+    with pytest.raises(Exception):
+        decode_state(state_data, serializer)
+
+
+def test_decode_state_dict_wrapper_decodes_to_dict_state() -> None:
+    serializer = JsonSerializer()
+    state_data = {"_data": {"answer": serializer.serialize(42)}}
+
+    result = decode_state(state_data, serializer)
+
+    assert isinstance(result, DictState)
+    assert result["answer"] == 42
+
+
+def test_decode_state_dict_wrapper_string_decodes_to_dict_state() -> None:
+    """Durable rows persist the DictState wrapper as a JSON string."""
+    serializer = JsonSerializer()
+    state_data = json.dumps({"_data": {"answer": serializer.serialize(42)}})
+
+    result = decode_state(state_data, serializer)
+
+    assert isinstance(result, DictState)
+    assert result["answer"] == 42
+
+
+def test_decode_state_returns_live_model_unchanged() -> None:
+    serializer = JsonSerializer()
+    state = TypedTestState(counter=9, name="live")
+
+    assert decode_state(state, serializer) is state
+
+
+def test_decode_state_pickle_serializer_typed_payload_round_trips() -> None:
+    """PickleSerializer encodes JSON-incapable typed state as a base64 string."""
+    serializer = PickleSerializer()
+    state = TypedTestState(counter=5, name="pickled")
+    state_data = base64.b64encode(pickle.dumps(state)).decode("utf-8")
+
+    result = decode_state(state_data, serializer)
+
+    assert isinstance(result, TypedTestState)
+    assert result.counter == 5
+    assert result.name == "pickled"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(json.dumps([1, 2, 3]), id="json-list-string"),
+        pytest.param(json.dumps("just a string"), id="json-scalar-string"),
+        pytest.param({"foo": 1}, id="dict-without-data-wrapper"),
+        pytest.param([1, 2, 3], id="list"),
+    ],
+)
+def test_decode_state_unrecognized_payload_raises(payload: object) -> None:
+    with pytest.raises(ValueError, match="state payload"):
+        decode_state(payload, JsonSerializer())
+
+
+def test_decode_state_none_yields_default_empty_state() -> None:
+    """Blank-store handoffs serialize as state_data=None and must stay valid."""
+    serializer = JsonSerializer()
+
+    result = decode_state(None, serializer)
+
+    assert isinstance(result, DictState)
+    assert len(list(result.items())) == 0
+
+
+def test_deserialize_state_from_dict_accepts_deprecated_state_type_kwarg() -> None:
+    """Released llama-agents-dbos 0.3.x still passes state_type=; it must be ignored, not a TypeError."""
+    serializer = JsonSerializer()
+    store = InMemoryStateStore(TypedTestState(counter=3, name="kwarg"))
+    payload = store.to_dict(serializer)
+
+    with_kwarg = deserialize_state_from_dict(payload, serializer, state_type=DictState)
+    without_kwarg = deserialize_state_from_dict(payload, serializer)
+
+    assert isinstance(with_kwarg, TypedTestState)
+    assert with_kwarg == without_kwarg
+
+
 @pytest.mark.asyncio
 async def test_deserialize_state_from_dict_with_dict_state() -> None:
     """Test deserializing DictState from to_dict() format."""
@@ -746,6 +1281,17 @@ async def test_deserialize_state_from_dict_with_dict_state() -> None:
     assert isinstance(result, DictState)
     assert result["counter"] == 42
     assert result["name"] == "test-value"
+
+
+@pytest.mark.asyncio
+async def test_in_memory_get_preserves_mutable_value_identity() -> None:
+    store = InMemoryStateStore(DictState())
+    await store.set("state", {"items": []})
+
+    state = await store.get("state")
+    state["items"].append("persisted")
+
+    assert await store.get("state.items") == ["persisted"]
 
 
 def test_deserialize_state_from_dict_with_typed_state() -> None:
@@ -1016,3 +1562,29 @@ def test_in_memory_state_store_from_dict_rejects_sql_format() -> None:
 
     with pytest.raises(ValueError, match="Cannot parse store_type 'sql'"):
         InMemoryStateStore.from_dict(sql_format, serializer)
+
+
+def test_pre_run_store_access_rejects_durable_state_handle(workflow: Workflow) -> None:
+    ctx = Context.from_dict(
+        workflow,
+        {"version": 1, "state": {"store_type": "sqlite", "run_id": "run-1"}},
+    )
+
+    with pytest.raises(ContextSerdeError, match="durable state store 'sqlite'"):
+        _ = ctx.store
+
+
+def test_basic_runtime_rejects_durable_state_handle(workflow: Workflow) -> None:
+    runtime = BasicRuntime()
+
+    with pytest.raises(
+        WorkflowRuntimeError,
+        match="BasicRuntime cannot restore durable state store 'postgres'",
+    ):
+        runtime.run_workflow(
+            "run-durable",
+            workflow,
+            BrokerState.from_workflow(workflow),
+            serialized_state={"store_type": "postgres", "run_id": "run-1"},
+            serializer=JsonSerializer(),
+        )

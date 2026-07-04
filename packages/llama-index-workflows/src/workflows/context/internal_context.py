@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections import Counter, defaultdict
@@ -22,6 +23,7 @@ from workflows.runtime.types.results import (
     StepWorkerStateContextVar,
     WaitingForEvent,
 )
+from workflows.runtime.types.step_id import StepId
 from workflows.runtime.types.ticks import TickAddEvent
 
 if TYPE_CHECKING:
@@ -106,6 +108,37 @@ class InternalContext(Generic[MODEL_T]):
                 f"{fn} may only be called from within a step function"
             )
 
+    @classmethod
+    def _stable_requirements_str(cls, requirements: dict[str, Any]) -> str:
+        """Return a deterministic representation for waiter requirements."""
+
+        def normalize(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {
+                    str(k): normalize(v)
+                    for k, v in sorted(value.items(), key=lambda item: repr(item[0]))
+                }
+            if isinstance(value, (list, tuple)):
+                return [normalize(v) for v in value]
+            if isinstance(value, set):
+                return sorted((normalize(v) for v in value), key=repr)
+            if hasattr(value, "model_dump"):
+                try:
+                    return normalize(value.model_dump())
+                except Exception:
+                    pass
+            return value
+
+        try:
+            return json.dumps(
+                normalize(requirements),
+                sort_keys=True,
+                separators=(",", ":"),
+                default=repr,
+            )
+        except Exception:
+            return repr(requirements)
+
     @property
     def store(self) -> StateStore[MODEL_T]:
         """Access workflow state store."""
@@ -159,9 +192,8 @@ class InternalContext(Generic[MODEL_T]):
 
         recovery_counts: dict[str, int] = {}
         try:
-            recovery_counts = dict(
-                StepWorkerStateContextVar.get().retry.recovery_counts
-            )
+            step_ctx = StepWorkerStateContextVar.get()
+            recovery_counts = dict(step_ctx.retry.recovery_counts)
         except LookupError:
             pass
 
@@ -169,7 +201,7 @@ class InternalContext(Generic[MODEL_T]):
             self._internal_adapter.send_event(
                 TickAddEvent(
                     event=message,
-                    step_name=step,
+                    step_id=StepId.root(step) if step is not None else None,
                     recovery_counts=recovery_counts,
                 )
             )
@@ -191,8 +223,23 @@ class InternalContext(Generic[MODEL_T]):
 
         # Generate a unique key for the waiter
         event_str = f"{event_type.__module__}.{event_type.__name__}"
-        requirements_str = str(requirements)
-        waiter_id = waiter_id or f"waiter_{event_str}_{requirements_str}"
+        if waiter_id is None:
+            requirements_str = self._stable_requirements_str(requirements)
+            legacy_waiter_id = f"waiter_{event_str}_{str(requirements)}"
+            base_waiter_id = f"waiter_{event_str}_{requirements_str}"
+            work_item_id = step_ctx.state.work_item_id
+            work_item_waiter_id = (
+                f"{base_waiter_id}_{work_item_id}"
+                if work_item_id is not None
+                else base_waiter_id
+            )
+            existing_waiter_ids = {w.waiter_id for w in collected_waiters}
+            if legacy_waiter_id in existing_waiter_ids:
+                waiter_id = legacy_waiter_id
+            elif base_waiter_id in existing_waiter_ids:
+                waiter_id = base_waiter_id
+            else:
+                waiter_id = work_item_waiter_id
 
         waiter = next((w for w in collected_waiters if w.waiter_id == waiter_id), None)
         if waiter is not None and waiter.timed_out:

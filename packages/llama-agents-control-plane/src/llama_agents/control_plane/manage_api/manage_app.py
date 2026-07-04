@@ -11,6 +11,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 
+from ..k8s_client import k8s_health_check
 from ..lifecycle import shutdown_event
 from .backup_v1beta1 import router as backup_v1beta1
 from .deployments_v1beta1 import router as deployments_v1beta1
@@ -89,4 +90,15 @@ app.include_router(backup_v1beta1)
 
 @app.get("/health")
 async def health() -> dict[str, str]:
+    """Process check with no k8s dependency; backs the startup and liveness probes.
+    Restarting doesn't fix an apiserver outage, so liveness stays independent of it —
+    only `/readyz` checks k8s."""
     return {"status": "ok"}
+
+
+@app.get("/readyz")
+async def readyz() -> JSONResponse:
+    """Readiness: exercises the kube-apiserver path so a pod with a wedged
+    connection is pulled from Service rotation instead of serving errors."""
+    status_code, body = await k8s_health_check()
+    return JSONResponse(status_code=status_code, content=body)
