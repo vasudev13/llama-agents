@@ -473,14 +473,14 @@ def test_init_without_either_raises_value_error() -> None:
     with pytest.raises(
         ValueError, match="Either httpx_client or base_url must be provided"
     ):
-        WorkflowClient()  # pyright: ignore[reportCallIssue]
+        WorkflowClient()  # pyright: ignore[reportCallIssue]  # ty: ignore[no-matching-overload]
 
 
 def test_init_with_both_raises_value_error() -> None:
     with pytest.raises(
         ValueError, match="Only one of httpx_client or base_url must be provided"
     ):
-        WorkflowClient(  # pyright: ignore[reportCallIssue]
+        WorkflowClient(  # pyright: ignore[reportCallIssue]  # ty: ignore[no-matching-overload]
             httpx_client=AsyncClient(),
             base_url="http://test",
         )

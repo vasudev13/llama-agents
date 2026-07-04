@@ -50,8 +50,8 @@ from workflows.runtime.types.commands import (
     CommandFailWorkflow,
     CommandHalt,
 )
-from workflows.runtime.types.step_id import StepId
 from workflows.runtime.types.internal_state import BrokerState, EventAttempt
+from workflows.runtime.types.step_id import StepId
 
 
 class WaitableExternalEvent(HumanResponseEvent):
